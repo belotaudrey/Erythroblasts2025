@@ -1,0 +1,13 @@
+,SampleName,Genotype,Treatment,Genotype_treatment
+A01,A01,WT,Ctl,WT_Ctl
+A02,A02,WT,SB,WT_SB
+A03,A03,KO,Ctl,KO_Ctl
+A04,A04,KO,SB,KO_SB
+A05,A05,WT,Ctl,WT_Ctl
+A06,A06,WT,SB,WT_SB
+A07,A07,KO,Ctl,KO_Ctl
+A08,A08,KO,SB,KO_SB
+A09,A09,WT,Ctl,WT_Ctl
+A10,A10,WT,SB,WT_SB
+A11,A11,KO,Ctl,KO_Ctl
+A12,A12,KO,SB,KO_SB

@@ -1,0 +1,507 @@
+---
+title: "A cell-nonautonomous heme acquisition pathway enables erythroid hemoglobinization under stress"
+author: "Audrey Belot"
+date: "2023-11-20"
+output: html_document
+---
+
+# 1. Packages
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(DoubletFinder)
+library(harmony)
+library(ggplot2)
+library(gridExtra)
+library(RColorBrewer)
+library(SingleR)
+library(pheatmap)
+library(celldex)
+library(extrafont)
+library(cowplot)
+library(readxl)
+library(ggrepel)
+
+# Load Arial font
+extrafont::loadfonts(device = "pdf")
+```
+
+
+# 2. Doublets detection
+
+source : https://github.com/chris-mcginnis-ucsf/DoubletFinder
+
+Best Practices :
+
+- DoubletFinder should not be applied on aggregated ScRNA seq data
+- Not run on merged data (different samples may have different proportions of cell type and merged objects can be large in size)
+- Should be run in distinct samples separately
+- Input data should be cleared of low-quality cells
+Remove clusters with low RNA UMIs, high mitochondrial read % and uninformative marker genes
+
+Workflow :
+
+a) Use separated data (WT vs KO) and filter them
+
+b) For each Seurat Object, run the Standard Workflow:
+
+seurat.obj <- CreateSeuratObject(counts = ...)
+seurat.obj$mitoPercent <- PercentageFeatureSet(pbmc.seurat, pattern = '^mt-')
+seurat.filtered <- subset(pbmc.seurat, subset = nCount_RNA > X & nFeature_RNA > Y & mitoPercent < Z) # choose X,Y,Z
+seurat.filtered <- NormalizeData(object = seurat.filtered)
+seurat.filtered <- FindVariableFeatures(object = seurat.filtered)
+seurat.filtered <- ScaleData(object = seurat.filtered)
+seurat.filtered <- RunPCA(object = seurat.filtered)
+ElbowPlot(seurat.filtered)
+seurat.filtered <- FindNeighbors(object = seurat.filtered, dims = 1:20)
+seurat.filtered <- FindClusters(object = seurat.filtered)
+seurat.filtered <- RunUMAP(object = seurat.filtered, dims = 1:20)
+
+c) Run DoubletFinder workflow for each dataset:
+
+
+### 2.1 FindDoublet on WT
+```{r}
+### Standard Workflow
+cts.wt <- Read10X_h5("WT_filtered_feature_bc_matrix.h5")
+wt.seurat <- CreateSeuratObject(counts = cts.wt, project = "AB", min.cells = 3, min.features = 5)
+
+wt.seurat$mitoPercent <- PercentageFeatureSet(wt.seurat, pattern = '^mt-')
+wt.seurat
+wt.seurat <- subset(wt.seurat, subset = nCount_RNA >= 5 & nFeature_RNA < 2500 & mitoPercent <5)
+wt.seurat
+# 3181 to 2938 samples => multiple rate = 0.023
+wt.seurat <- NormalizeData(object = wt.seurat)
+wt.seurat <- FindVariableFeatures(object = wt.seurat)
+wt.seurat <- ScaleData(object = wt.seurat)
+wt.seurat <- RunPCA(object = wt.seurat)
+ElbowPlot(wt.seurat)
+wt.seurat <- FindNeighbors(object = wt.seurat, dims = 1:15)
+wt.seurat <- FindClusters(object = wt.seurat, resolution = 0.15)
+Idents(wt.seurat) <- "RNA_snn_res.0.15"
+wt.seurat <- RunUMAP(object = wt.seurat, dims = 1:15)
+DimPlot(wt.seurat, reduction = 'umap')
+```
+
+##### 2.1.1 pK Identification
+```{r}
+wt.sweep.res.list <- paramSweep(wt.seurat, PCs = 1:15, sct = FALSE)
+wt.sweep.stats <- summarizeSweep(wt.sweep.res.list, GT = FALSE)
+wt.bcmvn <- find.pK(wt.sweep.stats)
+
+ggplot(wt.bcmvn, aes(pK, BCmetric, group = 1)) +
+  geom_point() +
+  geom_line()
+
+wt.pK <- wt.bcmvn %>% # select the pK that corresponds to max bcmvn to optimize doublet detection
+  filter(BCmetric == max(BCmetric)) %>%
+  select(pK) 
+wt.pK <- as.numeric(as.character(wt.pK[[1]]))
+
+```
+
+##### 2.1.2 Homotypic Doublet Proportion Estimate
+```{r}
+wt.annotations <- wt.seurat@meta.data$seurat_clusters
+wt.homotypic.prop <- modelHomotypic(wt.annotations)
+wt.nExp_poi <- round(0.023*nrow(wt.seurat@meta.data))
+wt.nExp_poi.adj <- round(wt.nExp_poi*(1-wt.homotypic.prop))
+```
+
+```{r}
+# run doubletFinder     Adjust parameters here
+wt.seurat.filtered.obj <- DoubletFinder::doubletFinder(wt.seurat, 
+                                     PCs = 1:15, 
+                                     pN = 0.05, 
+                                     pK = wt.pK, 
+                                     nExp = wt.nExp_poi.adj,
+                                     reuse.pANN = NULL, sct = FALSE) # reuse.pANN param was FALSE before but now have to use NULL to avoid error
+```
+
+```{r}
+# visualize doublets
+DimPlot(wt.seurat.filtered.obj, reduction = 'umap', group.by = "DF.classifications_0.05_0.3_49")
+```
+
+```{r}
+# number of singlets and doublets
+table(wt.seurat.filtered.obj@meta.data[["DF.classifications_0.05_0.3_49"]])
+```
+
+
+
+##### 2.3 Remove doublets
+```{r}
+wt.doublet <- rownames(subset(wt.seurat.filtered.obj, subset = DF.classifications_0.05_0.3_49 == 'Doublet')@meta.data)
+wt.singlet <-rownames(subset(wt.seurat.filtered.obj, subset = DF.classifications_0.05_0.3_49 == 'Singlet')@meta.data)
+```
+
+# 3. Integrate Single Cell RNA Seq Datasets - Seurat or Harmoy
+```{r}
+## 1.- Create Seurat Objects
+
+# Count Matrix for both genotypes
+cts.wt <- Read10X_h5("WT_filtered_feature_bc_matrix.h5")
+
+# Read singlets IDs
+singlets <- wt.singlet
+
+# Seurat object
+seurat.obj.wt <- CreateSeuratObject(cts.wt, min.cells = 3, min.features = 5)
+
+## 2. - QC & Filtering
+
+# - create a sample column
+seurat.obj.wt$sample <- rownames(seurat.obj.wt@meta.data)
+
+# - remove doublets
+seurat.obj.wt <- subset(seurat.obj.wt, subset = sample %in% singlets) #replace Barcode by sample
+
+# - calculate mitochondrial percentage
+seurat.obj.wt$mitoPercent <- PercentageFeatureSet(seurat.obj.wt, pattern='^mt-')
+
+# - filtering
+seurat.obj.wt_filtered <- subset(seurat.obj.wt, subset = nCount_RNA > 5 & nFeature_RNA < 2500 & mitoPercent < 5)
+
+seurat.obj.wt_filtered
+
+```
+
+
+```{r}
+## 3. - Standard workflow steps on the non integrated data to figure out if we see any batch effects
+
+seurat.obj.wt_filtered <- NormalizeData(object = seurat.obj.wt_filtered)
+seurat.obj.wt_filtered <- FindVariableFeatures(object = seurat.obj.wt_filtered)
+seurat.obj.wt_filtered <- ScaleData(object = seurat.obj.wt_filtered)
+seurat.obj.wt_filtered <- RunPCA(object = seurat.obj.wt_filtered)
+ElbowPlot(seurat.obj.wt_filtered)
+seurat.obj.wt_filtered <- FindNeighbors(object = seurat.obj.wt_filtered, dims = 1:15)
+seurat.obj.wt_filtered <- FindClusters(object = seurat.obj.wt_filtered, resolution = 0.15)
+Idents(seurat.obj.wt_filtered) <- "RNA_snn_res.0.15"
+seurat.obj.wt_filtered <- RunUMAP(object = seurat.obj.wt_filtered, dims = 1:15)
+
+```
+
+```{r}
+
+f1 <- DimPlot(seurat.obj.wt_filtered, reduction = "umap")
+f1
+```
+
+
+# 4. Find markers
+
+```{r}
+# visualize data
+clusters <- DimPlot(seurat.obj.wt_filtered, reduction = 'umap', group.by = 'seurat_clusters', label = TRUE)
+clusters
+```
+
+
+```{r}
+seurat.obj.wt_filtered[['RNA']] <- JoinLayers(seurat.obj.wt_filtered[['RNA']])
+```
+
+```{r}
+# findAll markers
+all.markers <- FindAllMarkers(seurat.obj.wt_filtered,
+               logfc.threshold = 0.25,
+               min.pct = 0.5,
+               only.pos = TRUE,
+               test.use = 'DESeq2',
+               slot = 'counts')
+```
+
+```{r}
+all.genes <- rownames(seurat.obj.wt_filtered)
+head(all.genes)
+```
+
+```{r}
+all.genes[grepl("Tfr", all.genes)]
+```
+
+```{r}
+rownames(all.markers)
+```
+
+
+
+
+# 5. Cells Annotation
+
+
+```{r}
+# script to annotate cell types using celldex::MouseRNAseqData() reference
+
+## install SingleR
+# if (!require("BiocManager", quietly = TRUE))
+#   install.packages("BiocManager")
+# 
+# BiocManager::install("SingleR")
+# BiocManager::valid()
+
+## install celldex
+# if (!require("BiocManager", quietly = TRUE))
+#   install.packages("BiocManager")
+# 
+# BiocManager::install("celldex")
+# BiocManager::valid()
+```
+
+```{r}
+## Import Seurat Object - already processed - cleaned - filtered
+seurat.obj.wt_filtered[['RNA']] <- JoinLayers(seurat.obj.wt_filtered[['RNA']])
+
+## Look at data - clusters
+# View(seurat.obj.wt_filtered@meta.data)
+DimPlot(seurat.obj.wt_filtered, reduction = 'umap')
+```
+
+```{r}
+# run SingleR (default mode) ---------
+# default for SingleR is to perform annotation of each individual cell in the test dataset
+
+# get reference data -----------
+ref <- celldex::MouseRNAseqData()
+# View(as.data.frame(colData(ref)))
+merged_counts <- GetAssayData(seurat.obj.wt_filtered, layer = 'counts')
+
+pred <- SingleR(test = merged_counts,
+                ref = ref,
+                labels = ref$label.main)
+
+pred
+
+seurat.obj.wt_filtered$singleR.labels <- pred$labels[match(rownames(seurat.obj.wt_filtered@meta.data), rownames(pred))]
+DimPlot(seurat.obj.wt_filtered, reduction = 'umap', group.by = 'singleR.labels')
+```
+
+```{r}
+# Annotation diagnostics ----------
+
+# ...Based on the scores within cells -----------
+pred
+pred$scores
+
+# plotScoreHeatmap(pred)
+
+# Generate the heatmap
+p <- plotScoreHeatmap(pred)
+
+# Modify the font to Arial
+print(p + theme(text = element_text(family = "Arial")))
+
+```
+
+```{r}
+# ...Based on deltas across cells ----------
+
+plotDeltaDistribution(pred)
+
+# ...Comparing to unsupervised clustering ------------
+
+tab <- table(Assigned=pred$labels, Clusters=seurat.obj.wt_filtered$seurat_clusters)
+pheatmap(log10(tab+10), color = colorRampPalette(c('white','blue'))(10))
+```
+
+
+# 6. Figures
+
+```{r}
+seurat.obj.wt_filtered[['RNA']] <- JoinLayers(seurat.obj.wt_filtered[['RNA']])
+
+# # Modify the seurat_clusters labels
+seurat.obj.wt_filtered$population <- factor(seurat.obj.wt_filtered$seurat_clusters,
+                                             levels = c(0, 1, 2, 3),
+                                             labels = c("V", "IV", "II", "III"))
+
+# Set the levels of 'population' to sort the axis as desired
+seurat.obj.wt_filtered$population <- factor(seurat.obj.wt_filtered$population, 
+                                             levels = c("II", "III", "IV", "V"))
+
+# Set the identity class of the Seurat object to the 'population' column
+Idents(seurat.obj.wt_filtered) <- "population"
+```
+
+
+## 6.1 UMAP 
+
+```{r}
+
+levels(seurat.obj.wt_filtered)
+
+# Custom colors
+custom_colors <- c("V" = "gold", "II" = "lightgreen", "III" = "orangered", "IV" = "lightblue")
+
+# Create UMAP plot with Arial font
+pdf("umap.pdf", width = 6, height = 6)
+print(
+  DimPlot(seurat.obj.wt_filtered, reduction = 'umap', cols = custom_colors) +
+    labs(x = "UMAP 1", y = "UMAP 2") +
+    theme(
+      # axis.text.x = element_text(size = 20, family = "Arial"),
+      # axis.text.y = element_text(size = 20, family = "Arial"),
+      # axis.title = element_text(size = 20, family = "Arial"),
+      plot.title = element_text(size = 20, face = "bold", hjust = 0.5, family = "Arial"),
+      axis.line = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 2),
+      # legend.text = element_text(size = 20, family = "Arial"),
+      # legend.title = element_text(size = 20, family = "Arial")
+      )
+)
+dev.off()
+
+# UMAP plot without titles with Arial font
+pdf("umap_no_titles.pdf", width = 6, height = 6)
+print(
+  DimPlot(seurat.obj.wt_filtered, reduction = 'umap', cols = custom_colors) +
+    labs(x = "", y = "") +
+    theme(
+      # axis.text.x = element_text(size = 20, family = "Arial"),  
+      # axis.text.y = element_text(size = 20, family = "Arial"),  
+      # axis.title = element_text(size = 20, family = "Arial"),
+      plot.title = element_text(size = 20, face = "bold", hjust = 0.5, family = "Arial"),
+      axis.line = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 2),
+      # legend.text = element_text(size = 20, family = "Arial"),
+      # legend.title = element_text(size = 20, family = "Arial")
+      )
+)
+dev.off()
+```
+
+
+
+
+
+```{r}
+# Custom colors for gradient
+custom_colors <- colorRampPalette(c("antiquewhite", "limegreen", "darkslategray1", "mediumblue", "magenta", "red"))(50)
+
+# Loop through genes to generate UMAP plots
+for (i in c("Hbb-bt", "Slc48a1", "Gypa", "Hmox1", "Slc40a1", "Tfrc", "Cd44")) {
+  
+  # Reformat gene name to avoid errors while saving the file
+  gene_file_name = gsub("-", "_", tolower(i))
+  
+  # Start PDF output
+  pdf(paste("Genes_umap/",gene_file_name, ".pdf", sep=""), width = 6, height = 6)
+  
+  # Print the FeaturePlot with custom color gradient and Arial font
+  print(
+    FeaturePlot(seurat.obj.wt_filtered, features = i, min.cutoff = 0, max.cutoff = 8) + 
+      scale_color_gradientn(colors = custom_colors, limits = c(0, 8)) +
+      labs(x = "", y = "") +
+      ggtitle(i) +
+      theme(
+      #   # axis.text.x = element_text(size = 20, family = "Arial"),  
+      #   # axis.text.y = element_text(size = 20, family = "Arial"),  
+      #   # axis.title = element_text(size = 20, family = "Arial"),
+      #   plot.title = element_text(size = 20, face = "bold", hjust = 0.5, family = "Arial"),
+      #   # axis.line = element_blank(),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 2),
+      #   # legend.text = element_text(size = 20, family = "Arial"),
+      #   # legend.title = element_text(size = 20, family = "Arial"),
+      #   legend.position = "right"
+        )
+  )
+  dev.off()
+}
+```
+
+
+## 6.2 Expression level : Ridge plots
+```{r}
+
+custom_colors <- c("V" = "gold", "II" = "lightgreen", "III" = "orangered", "IV" = "lightblue")
+
+# Loop through genes to generate RidgePlot
+for (i in c("Hbb-bt", "Slc48a1", "Gypa", "Hmox1", "Slc40a1", "Tfrc", "Cd44")) {
+  
+  # Reformat gene name to avoid errors while saving the file
+  gene_file_name <- gsub("-", "_", tolower(i))
+  
+  # Start PDF output
+  pdf(paste("Genes_ridgeplot/", gene_file_name, ".pdf", sep=""), width = 6, height = 6)
+  
+  # Print the RidgePlot with custom color gradient and Arial font
+  print(
+    RidgePlot(seurat.obj.wt_filtered, features = i, cols = custom_colors) + 
+      ggtitle(i) +
+      theme_minimal() + 
+      labs(x = "", y = "") +
+      theme(
+        # axis.text.x = element_text(size = 20, colour = "black", family = "Arial"),  
+        # axis.text.y = element_text(size = 20, colour = "black", family = "Arial"),  
+        # axis.title = element_text(size = 20, family = "Arial"),
+        # plot.title = element_text(size = 20, face = "bold", hjust = 0.5, family = "Arial"),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 2),
+        # legend.text = element_text(size = 20, family = "Arial"),
+        # legend.title = element_text(size = 20, family = "Arial")
+        )
+  )
+  dev.off()
+}
+
+```
+
+
+
+## 6.3 Heatmap Cell Type
+
+```{r}
+ref <- celldex::MouseRNAseqData()
+counts <- GetAssayData(seurat.obj.wt_filtered, layer = 'counts')
+pred <- SingleR(test = counts,
+                ref = ref,
+                labels = ref$label.main)
+seurat.obj.wt_filtered$singleR.labels <- pred$labels[match(rownames(seurat.obj.wt_filtered@meta.data), rownames(pred))]
+```
+
+```{r}
+plotScoreHeatmap(pred)
+```
+```{r}
+library(extrafont)  # For font management
+library(showtext)   # Optional: If you prefer using showtext
+
+# Convert scores to a matrix
+matrix <- as.matrix(t(pred$scores))
+
+# Assign column names
+colnames(matrix) <- paste0("V", seq_len(ncol(matrix)))
+
+# Create annotation dataframe
+annotation_df <- data.frame(Label = pred$labels, row.names = colnames(matrix))
+
+# Define 13 pastel colors for annotation
+pastel_colors <- c(brewer.pal(9, "Set3"), brewer.pal(8, "Pastel1"))[1:13]  # Ensure exactly 13 colors
+unique_labels <- unique(pred$labels)
+annotation_colors <- list(Label = setNames(pastel_colors[seq_along(unique_labels)], unique_labels))
+
+# Define the Blues colorscale
+color_scale <- brewer.pal(9, "Blues")
+
+# Define breaks with a focus on ensuring data values are between 0 and 0.06
+# breaks <- seq(0, 0.06, length.out = 101)  # Breaks from 0 to 0.06
+
+# Automatically use fonts
+showtext_auto()
+
+# Plot heatmap with Arial font
+pdf("heatmap_cell_type.pdf", width = 12, height = 12)
+pheatmap(matrix,
+         cluster_cols = FALSE,
+         show_colnames = FALSE,
+         annotation_col = annotation_df,
+         annotation_colors = annotation_colors,
+         color = color_scale,  # Apply Blues colorscale
+         # breaks = breaks,      # Ensure color scale is between 0 and 0.06
+         fontsize = 25,
+         family = "Arial")  # Set font family to Arial
+dev.off()
+```
